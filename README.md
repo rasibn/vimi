@@ -23,8 +23,13 @@ GLOBAL OPTIONS:
    --files, -f    Search directories instead of files (default: false)
    --help, -h     show help
 ```
+
 ### Example
 
 ```bash
 vimi -p
+```
+
+```bash
+cd (vimi --files)
 ```
