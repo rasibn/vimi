@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"os"
@@ -37,114 +38,152 @@ func main() {
 			searchDirs := c.Bool("files")
 			depth := c.Int("depth")
 
-			// Collect CLI args first; only fall back to env if none provided
-			searchPaths := c.Args().Slice()
-			if len(searchPaths) == 0 {
+			paths := c.Args().Slice()
+			if len(paths) == 0 {
 				for _, env := range []string{"PROJECT_DIR", "WORK_DIR", "ASSET_DIR"} {
-					if val := os.Getenv(env); val != "" {
-						searchPaths = append(searchPaths, val)
+					if v := os.Getenv(env); v != "" {
+						paths = append(paths, v)
 					}
 				}
 			}
-			if len(searchPaths) == 0 {
-				searchPaths = []string{"."}
+			if len(paths) == 0 {
+				paths = []string{"."}
 			}
 
-			// Ensure fd is present
-			if !commandExists("fd") {
-				return fmt.Errorf("'fd' is required but not found in PATH")
-			}
-
-			if searchDirs {
-				selectedDir, err := findDirectory(searchPaths, usePreview, depth)
-				if err != nil {
-					return fmt.Errorf("failed to find directory: %w", err)
-				}
-				if selectedDir == "" {
-					return nil
-				}
-				fmt.Println(selectedDir)
-				return nil
-			}
-
-			selectedFile, err := findFile(searchPaths, usePreview, depth)
+			searcher, err := chooseSearcher()
 			if err != nil {
-				return fmt.Errorf("failed to find file: %w", err)
+				return err
 			}
-			if selectedFile == "" {
-				fmt.Fprintln(os.Stderr, "No file selected.")
+
+			itemType := "f"
+			if searchDirs {
+				itemType = "d"
+			}
+
+			out, err := searcher.Search(SearchOptions{ItemType: itemType, Depth: depth, Paths: paths})
+			if err != nil {
+				return fmt.Errorf("search failed: %w", err)
+			}
+			if strings.TrimSpace(out) == "" {
 				return nil
 			}
 
-			return openInNvim(selectedFile)
+			selected, err := fzfPick(out, buildfzfPreviewArgs(usePreview, itemType))
+			if err != nil {
+				return err
+			}
+			if selected == "" {
+				return nil
+			}
+
+			if itemType == "d" {
+				fmt.Println(selected)
+				return nil
+			}
+			return openInNvim(selected)
 		},
 	}
-
 	if err := app.Run(os.Args); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func findFile(paths []string, usePreview bool, depth int) (string, error) {
-	return findItems(paths, usePreview, "f", depth)
+func chooseSearcher() (Searcher, error) {
+	if commandExists("fd") {
+		return &FdSearcher{}, nil
+	}
+	if commandExists("find") {
+		return &FindSearcher{}, nil
+	}
+	return nil, fmt.Errorf("neither fd nor find is installed")
 }
 
-func findDirectory(paths []string, usePreview bool, depth int) (string, error) {
-	return findItems(paths, usePreview, "d", depth)
+type SearchOptions struct {
+	ItemType string
+	Depth    int
+	Paths    []string
 }
 
-func findItems(paths []string, usePreview bool, itemType string, depth int) (string, error) {
-	fzfArgs := []string{"fzf"}
-	if usePreview {
-		if itemType == "f" && commandExists("bat") {
-			fzfArgs = append(fzfArgs,
-				"--ansi",
-				"--preview-window=right:45%",
-				"--preview=bat --color=always --style=header,grid --line-range :300 {}",
-			)
-		} else if itemType == "d" {
-			fzfArgs = append(fzfArgs,
-				"--ansi",
-				"--preview-window=right:45%",
-				"--preview=ls -la {}",
-			)
-		}
-	}
+type Searcher interface {
+	Search(opts SearchOptions) (string, error)
+	Name() string
+}
 
-	// Build fd args: options first, then search paths via --search-path, then the match-all pattern "."
-	args := []string{
-		"--type", itemType, // "f" or "d"
-		"--hidden",
-		"--follow",
-		"--exclude", ".git",
+type (
+	FdSearcher   struct{}
+	FindSearcher struct{}
+)
+
+func (s *FdSearcher) Name() string   { return "fd" }
+func (s *FindSearcher) Name() string { return "find" }
+
+func (s *FdSearcher) Search(opts SearchOptions) (string, error) {
+	args := []string{"--type", opts.ItemType, "--hidden", "--follow", "--exclude", ".git"}
+	if opts.Depth > 0 {
+		args = append(args, "--max-depth", fmt.Sprint(opts.Depth))
 	}
-	if depth > 0 {
-		args = append(args, "--max-depth", fmt.Sprint(depth))
-	}
-	for _, p := range paths {
+	for _, p := range opts.Paths {
 		args = append(args, "--search-path", p)
 	}
-	// Explicit pattern so fd doesn't treat the first path as the pattern.
 	args = append(args, ".")
-
-	findCmd := exec.Command("fd", args...)
-	// Capture stderr too so errors are informative
-	outBytes, err := findCmd.CombinedOutput()
+	cmd := exec.Command("fd", args...)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("fd search failed: %v\n%s", err, string(outBytes))
+		return "", fmt.Errorf("fd error: %v\n%s", err, string(out))
 	}
+	return string(out), nil
+}
 
-	fzfCmd := exec.Command(fzfArgs[0], fzfArgs[1:]...)
-	fzfCmd.Stdin = strings.NewReader(string(outBytes))
-	out, err := fzfCmd.Output()
+func (s *FindSearcher) Search(opts SearchOptions) (string, error) {
+	args := append([]string{}, opts.Paths...)
+	if opts.Depth > 0 {
+		args = append(args, "-maxdepth", fmt.Sprint(opts.Depth))
+	}
+	args = append(args, "-mindepth", "1")
+	args = append(args, "-not", "-path", "*/.git/*")
+	if opts.ItemType == "f" {
+		args = append(args, "-type", "f")
+	} else {
+		args = append(args, "-type", "d")
+	}
+	args = append(args, "-print")
+	cmd := exec.Command("find", args...)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		// Treat cancel/no-selection as empty result
-		if exitErr, ok := err.(*exec.ExitError); ok && (exitErr.ExitCode() == 130 || exitErr.ExitCode() == 1) {
-			return "", nil
+		return "", fmt.Errorf("find error: %v\n%s", err, string(out))
+	}
+	return string(out), nil
+}
+
+func fzfPick(candidates string, fzfArgs []string) (string, error) {
+	cmd := exec.Command("fzf", fzfArgs...)
+	cmd.Stdin = strings.NewReader(candidates)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if code := exitErr.ExitCode(); code == 130 || code == 1 {
+				return "", nil
+			}
 		}
 		return "", fmt.Errorf("fzf failed: %w", err)
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(out.String()), nil
+}
+
+func buildfzfPreviewArgs(enable bool, itemType string) []string {
+	if !enable {
+		return nil
+	}
+	if itemType == "f" && commandExists("bat") {
+		return []string{"--ansi", "--preview-window=right:45%", "--preview=bat --color=always --style=header,grid --line-range :300 {}"}
+	}
+	if itemType == "d" {
+		return []string{"--ansi", "--preview-window=right:45%", "--preview=ls -la {}"}
+	}
+	return nil
 }
 
 func openInNvim(file string) error {
